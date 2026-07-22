@@ -1,0 +1,19 @@
+# secrets — never commit
+.env
+
+# build output
+/transcribe
+/dist
+
+# transcripts (tool output) — force-add with `git add -f` if one belongs in the repo
+*.txt
+
+# media & test artifacts
+*.mp3
+*.mp4
+*.mov
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.wav
