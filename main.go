@@ -34,9 +34,15 @@ const (
 	sttModel           = "scribe_v2"
 	maxTurnSeconds     = 120.0 // split a single speaker's turn into paragraphs beyond this
 	maxPromptChars     = 160_000
-	defaultClaudeModel = "claude-haiku-4-5-20251001"
-	geminiModel        = "gemini-2.5-flash"
 	maxParallel        = 4 // concurrent transcriptions; Scribe allows >= 8 on every plan
+
+	// Default model per LLM backend, used when --llm-model is not given. The
+	// --llm-model value is passed verbatim to whichever backend is active, so
+	// valid overrides are that provider's model IDs / CLI model names.
+	defaultOpenAIModel = "gpt-5.6-terra"
+	defaultClaudeModel = "claude-haiku-4-5-20251001" // Anthropic API and claude CLI
+	defaultGeminiModel = "gemini-2.5-flash"
+	defaultCodexModel  = "gpt-5.6-sol"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -65,7 +71,8 @@ usage:
   transcribe [flags] <media file, URL, or - for stdin> ...
 
 Inputs may be media files in any format ffmpeg reads, YouTube/TikTok/hosted-media
-URLs (fetched server-side by ElevenLabs), or - for stdin. Multiple inputs are
+URLs (fetched server-side by ElevenLabs), - for stdin, or a .json saved by --raw
+(reprocessed from disk without calling the API again). Multiple inputs are
 transcribed in parallel. Flags may appear before or after inputs; -- ends flags.
 
 flags:
@@ -86,9 +93,12 @@ flags:
       --verbatim          keep filler words and false starts (disable
                           server-side cleanup)
       --no-llm            skip the LLM speaker-naming / proper-noun pass
-      --llm-model <name>  override the model used for the LLM pass
-      --raw <path>        also save the raw Scribe JSON response to this path
-                          (single input only)
+      --llm-model <name>  model for the LLM pass; value must match the active
+                          backend (OpenAI key › Anthropic key › Gemini key ›
+                          codex CLI › claude CLI). See "LLM backends" in README
+      --raw <path>        also save the raw Scribe JSON to this path (single
+                          input only); pass that .json back as an input later to
+                          rerun the LLM pass or rebuild subtitles for free
   -q, --quiet             only print the output path
       --version           print version and exit
   -h, --help              show this help
@@ -99,6 +109,8 @@ examples:
   transcribe -c "The Rest Is History; hosts Tom Holland and Dominic Sandbrook" episode.mp3
   transcribe --srt --vtt lecture.mov
   some-pipeline | transcribe -
+  transcribe episode.mp4 --raw episode.json           # keep the raw response
+  transcribe episode.json -c "host: Jane Doe" --srt   # reprocess it, no API call
 `
 
 func main() {
@@ -131,13 +143,22 @@ func run() error {
 	if home, err := os.UserHomeDir(); err == nil {
 		loadDotEnv(filepath.Join(home, ".config", "transcribe", "env"))
 	}
+	// Saved-response inputs never call Scribe, so the API key is only required
+	// when at least one input actually needs transcribing.
+	needsAPI := false
+	for _, in := range inputs {
+		if !isSavedResponse(in) {
+			needsAPI = true
+			break
+		}
+	}
 	apiKey := firstEnv("ELEVENLABS_API_KEY", "XI_API_KEY", "ELEVEN_API_KEY", "ELEVENLABS_KEY")
-	if apiKey == "" {
+	if needsAPI && apiKey == "" {
 		return errors.New("no ElevenLabs API key found: set ELEVENLABS_API_KEY (or XI_API_KEY) in the environment or a .env file")
 	}
 
 	keyterms := collectKeyterms(cfg.keyterms, cfg.context)
-	if len(keyterms) > 0 && !cfg.quiet {
+	if needsAPI && len(keyterms) > 0 && !cfg.quiet {
 		fmt.Fprintf(os.Stderr, "▸ biasing with %d keyterms\n", len(keyterms))
 	}
 
@@ -323,19 +344,26 @@ func transcribeFile(ctx context.Context, cfg *config, jb job, apiKey string, key
 	logf := jb.logf
 	live := !jb.multi && !cfg.quiet
 
-	src, err := buildAudioSource(ctx, jb.input)
-	if err != nil {
-		return err
-	}
-	logf("▸ audio: %s", src.desc)
-
-	raw, err := callScribe(ctx, cfg, src, apiKey, keyterms, logf, live)
-	if err != nil {
-		return err
-	}
-	if cfg.rawPath != "" {
-		if err := os.WriteFile(cfg.rawPath, raw, 0o644); err != nil {
-			return fmt.Errorf("saving raw response: %w", err)
+	var raw []byte
+	if isSavedResponse(jb.input) {
+		var err error
+		if raw, err = os.ReadFile(jb.input); err != nil {
+			return fmt.Errorf("reading saved response: %w", err)
+		}
+		logf("▸ reusing saved Scribe response (no API call)")
+	} else {
+		src, err := buildAudioSource(ctx, jb.input)
+		if err != nil {
+			return err
+		}
+		logf("▸ audio: %s", src.desc)
+		if raw, err = callScribe(ctx, cfg, src, apiKey, keyterms, logf, live); err != nil {
+			return err
+		}
+		if cfg.rawPath != "" {
+			if err := os.WriteFile(cfg.rawPath, raw, 0o644); err != nil {
+				return fmt.Errorf("saving raw response: %w", err)
+			}
 		}
 	}
 
@@ -458,6 +486,14 @@ func isDir(p string) bool {
 
 func isURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+// isSavedResponse reports whether input is a raw Scribe response saved by
+// --raw. Such inputs are reprocessed straight from disk — no second API call —
+// so a different --context, --llm-model, --no-llm, or --srt/--vtt can be
+// applied to an already-transcribed file for free.
+func isSavedResponse(input string) bool {
+	return strings.HasSuffix(strings.ToLower(input), ".json")
 }
 
 // displayBase is a short human name for an input: the file base name, "stdin",
@@ -1146,12 +1182,20 @@ type llmBackend struct {
 }
 
 // pickLLMBackend resolves once per process; env and PATH don't change mid-run.
+// Preference: API keys first (OpenAI, Anthropic, Gemini), then a local CLI
+// (Codex, Claude) if installed.
 var pickLLMBackend = sync.OnceValue(func() *llmBackend {
+	if os.Getenv("OPENAI_API_KEY") != "" {
+		return &llmBackend{"openai api", defaultOpenAIModel, callOpenAI}
+	}
 	if os.Getenv("ANTHROPIC_API_KEY") != "" {
 		return &llmBackend{"anthropic api", defaultClaudeModel, callAnthropic}
 	}
 	if geminiKey() != "" {
-		return &llmBackend{"gemini api", geminiModel, callGemini}
+		return &llmBackend{"gemini api", defaultGeminiModel, callGemini}
+	}
+	if _, err := exec.LookPath("codex"); err == nil {
+		return &llmBackend{"codex cli", defaultCodexModel, callCodexCLI}
 	}
 	if _, err := exec.LookPath("claude"); err == nil {
 		return &llmBackend{"claude cli", defaultClaudeModel, callClaudeCLI}
@@ -1175,6 +1219,63 @@ func callClaudeCLI(ctx context.Context, prompt, model string) (*llmResult, error
 		return nil, fmt.Errorf("claude cli: %v: %s", err, strings.TrimSpace(errBuf.String()))
 	}
 	return parseLLMJSON(out.String())
+}
+
+// callCodexCLI drives `codex exec`, whose stdout is a verbose session log; the
+// clean final message is captured via --output-last-message. stdin is closed so
+// codex doesn't block waiting for extra input.
+func callCodexCLI(ctx context.Context, prompt, model string) (*llmResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	out, err := os.CreateTemp("", "transcribe-codex-*.txt")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(out.Name())
+	out.Close()
+	cmd := exec.CommandContext(ctx, "codex", "exec",
+		"--skip-git-repo-check", "--sandbox", "read-only",
+		"-m", model, "--output-last-message", out.Name(), prompt)
+	cmd.Dir = os.TempDir()
+	cmd.Stdin = strings.NewReader("")
+	var errBuf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = io.Discard, &errBuf
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("codex cli: %v: %s", err, truncate(strings.TrimSpace(errBuf.String()), 200))
+	}
+	data, err := os.ReadFile(out.Name())
+	if err != nil {
+		return nil, err
+	}
+	return parseLLMJSON(string(data))
+}
+
+func callOpenAI(ctx context.Context, prompt, model string) (*llmResult, error) {
+	body, _ := json.Marshal(map[string]any{
+		"model":    model,
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("authorization", "Bearer "+os.Getenv("OPENAI_API_KEY"))
+	req.Header.Set("content-type", "application/json")
+	var parsed struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := doJSON(req, &parsed); err != nil {
+		return nil, err
+	}
+	var text strings.Builder
+	for _, c := range parsed.Choices {
+		text.WriteString(c.Message.Content)
+	}
+	return parseLLMJSON(text.String())
 }
 
 func callAnthropic(ctx context.Context, prompt, model string) (*llmResult, error) {
